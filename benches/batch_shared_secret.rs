@@ -38,6 +38,9 @@ macro_rules! batch_secret_benches {
                         }
                     })
                 });
+                preparation.bench_function(BenchmarkId::new("batch", peer_count), |b| {
+                    b.iter(|| black_box($instance.batch_prepare_peers(black_box(peer_keys))))
+                });
             }
             preparation.finish();
 
@@ -51,6 +54,21 @@ macro_rules! batch_secret_benches {
                     let prepared_peers = &prepared[..peer_count];
                     agreement.throughput(Throughput::Elements((peer_count * key_count) as u64));
                     let size = format!("{peer_count} peers, {key_count} keys");
+                    let expected: Vec<_> = prepared_peers
+                        .iter()
+                        .flat_map(|peer| {
+                            keys.iter()
+                                .map(|key| key.shared_secret_from_prepared(peer).unwrap())
+                        })
+                        .collect();
+                    assert_eq!(
+                        $instance
+                            .batch_shared_secrets(keys, prepared_peers)
+                            .into_iter()
+                            .collect::<Result<Vec<_>, _>>()
+                            .unwrap(),
+                        expected
+                    );
                     agreement.bench_function(BenchmarkId::new("serial", &size), |b| {
                         b.iter(|| {
                             for peer in black_box(prepared_peers) {
@@ -58,6 +76,16 @@ macro_rules! batch_secret_benches {
                                     black_box(key.shared_secret_from_prepared(peer).unwrap());
                                 }
                             }
+                        })
+                    });
+                    agreement.bench_function(BenchmarkId::new("batch", &size), |b| {
+                        b.iter(|| {
+                            black_box(
+                                $instance.batch_shared_secrets(
+                                    black_box(keys),
+                                    black_box(prepared_peers),
+                                ),
+                            );
                         })
                     });
                 }
