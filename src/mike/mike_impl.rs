@@ -275,8 +275,8 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>, const N: usize> Mike<Fp, Fp2, N
         let constants = self.params.constants;
         let a_div_three = curve.A / Fp2::THREE;
 
-        let P_32 = curve.double_iter_with_ws(&P, &a_div_three, constants.e - 3);
-        let Q_32 = curve.double_iter_with_ws(&Q, &a_div_three, constants.e - 3);
+        let (chain_doublings, [P_32, Q_32]) =
+            curve.prepare_chain_doublings(&a_div_three, &P, &Q, constants.e);
 
         // Compute points of order 16 for the diagonal isogeny kernel
         let P_16 = curve.double(&P_32);
@@ -289,6 +289,7 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>, const N: usize> Mike<Fp, Fp2, N
         Ok(PeerPoints {
             domain: curve,
             a_div_three,
+            chain_doublings,
             P,
             Q,
             P_32,
@@ -307,6 +308,7 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>, const N: usize> Mike<Fp, Fp2, N
         let PeerPoints {
             domain,
             a_div_three,
+            chain_doublings,
             P,
             Q,
             P_32,
@@ -319,6 +321,7 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>, const N: usize> Mike<Fp, Fp2, N
             _phantom_n: core::marker::PhantomData,
             domain,
             a_div_three,
+            chain_doublings,
             P,
             Q,
             P_x,
@@ -336,6 +339,7 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>, const N: usize> Mike<Fp, Fp2, N
 struct PeerPoints<Fp2: Fp2Trait> {
     domain: Curve<Fp2>,
     a_div_three: Fp2,
+    chain_doublings: super::isogeny_chain::PreparedDoublings<Fp2>,
     P: Point<Fp2>,
     Q: Point<Fp2>,
     P_32: Point<Fp2>,
@@ -347,16 +351,18 @@ struct PeerPoints<Fp2: Fp2Trait> {
 /// A validated peer public key with its public torsion points prepared for reuse.
 ///
 /// Construct via [`Mike::prepare_peer`]. The parameter set is bound to this value.
-/// Preparation is independent of the receiver's private scalar.
+/// Preparation is independent of the receiver's private scalar. It retains public
+/// basis multiples used by the isogeny strategy, so cloning also clones that cache.
 ///
 /// This value contains no secret data, but its construction has variable runtime
 /// dependent on the public key.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PreparedPeer<Fp: FqTrait, Fp2: Fp2Trait, const N: usize> {
     _phantom_fp: core::marker::PhantomData<Fp>,
     _phantom_n: core::marker::PhantomData<[u8; N]>,
     domain: Curve<Fp2>,
     a_div_three: Fp2,
+    chain_doublings: super::isogeny_chain::PreparedDoublings<Fp2>,
     P: Point<Fp2>,
     Q: Point<Fp2>,
     P_x: Fp2,
@@ -496,11 +502,12 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>, const N: usize> MikePrivateKey<
             peer.diagonal_kernel,
         );
 
-        let codomain = peer.domain.mike_isogeny_chain(
+        let codomain = peer.domain.mike_isogeny_chain_with_prepared_doublings(
             &peer.a_div_three,
             &gluing_kernel,
             &chain_kernel,
             self.constants.e,
+            Some(&peer.chain_doublings),
         );
 
         Ok(self.hash_modular_invariants(&codomain.absolute_modular_invariants()))
@@ -586,6 +593,73 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>, const N: usize> MikePrivateKey<
 
         // Compute the secret as the hash of these values
         Ok(self.hash_modular_invariants(&invariants))
+    }
+}
+
+#[cfg(test)]
+mod prepared_test {
+    use super::*;
+
+    fn check<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>, const N: usize>(mike: Mike<Fp, Fp2, N>) {
+        for seed in [7u8, 19] {
+            let (pk, _) = mike.keygen_seeded(&[seed; 48]).unwrap();
+            let peer = mike.prepare_peer(&pk).unwrap();
+            assert_eq!(
+                peer.P_32.equals(&peer.domain.double_iter_with_ws(
+                    &peer.P,
+                    &peer.a_div_three,
+                    peer.constants.e - 3
+                )),
+                u32::MAX
+            );
+            assert_eq!(
+                peer.Q_32.equals(&peer.domain.double_iter_with_ws(
+                    &peer.Q,
+                    &peer.a_div_three,
+                    peer.constants.e - 3
+                )),
+                u32::MAX
+            );
+            for index in 0..4 {
+                let (_, key) = mike.keygen_seeded(&[index; 48]).unwrap();
+                let (gluing, kernel) = key.generate_kernels_from_prepared(
+                    &peer.domain,
+                    &peer.P,
+                    Some(&peer.P_x),
+                    &peer.Q,
+                    Some(&peer.Q_x),
+                    &peer.P_32,
+                    &peer.Q_32,
+                    peer.scholten_kernel,
+                    peer.diagonal_kernel,
+                );
+                let expected = peer.domain.mike_isogeny_chain(
+                    &peer.a_div_three,
+                    &gluing,
+                    &kernel,
+                    key.constants.e,
+                );
+                let actual = peer.domain.mike_isogeny_chain_with_prepared_doublings(
+                    &peer.a_div_three,
+                    &gluing,
+                    &kernel,
+                    key.constants.e,
+                    Some(&peer.chain_doublings),
+                );
+                assert_eq!(actual.null_point().equals(&expected.null_point()), u32::MAX);
+                assert_eq!(
+                    key.shared_secret_from_prepared(&peer).unwrap(),
+                    key.shared_secret(&pk).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_doublings_match_unprepared() {
+        check(crate::mike::MIKE_I);
+        check(crate::mike::MIKE_III);
+        check(crate::mike::MIKE_V);
     }
 }
 

@@ -7,7 +7,40 @@ use crate::gluing::gluing_isogeny;
 use crate::mike::mike_impl::KernelPoints;
 use crate::theta::dim_four::{ThetaPoint, ThetaStructure};
 
+// The initial elliptic strategy is public and shared by preparation and agreement.
+fn initial_strategy_split(order: usize) -> usize {
+    if order >= 64 { order >> 1 } else { order - 1 }
+}
+
+/// Public basis multiples at the retained levels of the initial elliptic strategy.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedDoublings<Fp2: Fp2Trait>(Vec<[Point<Fp2>; 2]>);
+
 impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>> Curve<Fp2> {
+    /// Prepare the public multiples used to reconstruct paired kernel points.
+    pub(crate) fn prepare_chain_doublings(
+        &self,
+        a_div_three: &Fp2,
+        P: &Point<Fp2>,
+        Q: &Point<Fp2>,
+        len: usize,
+    ) -> (PreparedDoublings<Fp2>, [Point<Fp2>; 2]) {
+        let mut order = len - 2;
+        let mut basis = [*P, *Q];
+        let mut retained = Vec::new();
+        while order != 1 {
+            let m = initial_strategy_split(order);
+            basis = basis.map(|p| self.double_iter_with_ws(&p, a_div_three, m));
+            order -= m;
+            if order != 1 {
+                retained.push(basis);
+            }
+        }
+        // In total the basis was doubled len - 3 times, so the final points
+        // have order 32 and can also be used for the gluing kernels.
+        (PreparedDoublings(retained), basis)
+    }
+
     /// Advance the balanced strategy by doubling kernel points until
     /// the top of the stack has order 2. Returns the new stack depth.
     fn advance_strategy(
@@ -16,17 +49,13 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>> Curve<Fp2> {
         pts: &mut [[Point<Fp2>; 2]],
         orders: &mut [usize],
         k: usize,
+        prepared: Option<&PreparedDoublings<Fp2>>,
     ) -> usize {
         let mut k = k;
         while orders[k] != 1 {
             k += 1;
 
-            let m = if orders[k - 1] >= 64 {
-                // What should this value be? the dim 2 chain uses 16
-                orders[k - 1] >> 1
-            } else {
-                orders[k - 1] - 1
-            };
+            let m = initial_strategy_split(orders[k - 1]);
 
             orders[k] = orders[k - 1].saturating_sub(m);
             if orders[k] == 1 {
@@ -37,14 +66,24 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>> Curve<Fp2> {
 
             let [p1, p2] = pts[2 * k - 2];
             let [p3, p4] = pts[2 * k - 1];
-            pts[2 * k] = [
-                self.double_iter_with_ws(&p1, a_div_three, m),
-                self.double_iter_with_ws(&p2, a_div_three, m),
-            ];
-            pts[2 * k + 1] = [
-                self.double_iter_with_ws(&p3, a_div_three, m),
-                self.double_iter_with_ws(&p4, a_div_three, m),
-            ];
+            if let Some(prepared) = prepared {
+                // The paired points differ by public Q and -P. The table is
+                // indexed only by the public strategy, never by scalar bits.
+                let q = self.double_iter_with_ws(&p2, a_div_three, m);
+                let minus_p = self.double_iter_with_ws(&p4, a_div_three, m);
+                let [public_p, public_q] = prepared.0[k - 1];
+                pts[2 * k] = [self.add(&q, &public_q), q];
+                pts[2 * k + 1] = [self.sub(&minus_p, &public_p), minus_p];
+            } else {
+                pts[2 * k] = [
+                    self.double_iter_with_ws(&p1, a_div_three, m),
+                    self.double_iter_with_ws(&p2, a_div_three, m),
+                ];
+                pts[2 * k + 1] = [
+                    self.double_iter_with_ws(&p3, a_div_three, m),
+                    self.double_iter_with_ws(&p4, a_div_three, m),
+                ];
+            }
         }
         k
     }
@@ -58,6 +97,23 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>> Curve<Fp2> {
         chain_kernel: &[[Point<Fp2>; 2]; 2],
         len: usize,
     ) -> ThetaStructure<Fp> {
+        self.mike_isogeny_chain_with_prepared_doublings(
+            a_div_three,
+            gluing_kernel,
+            chain_kernel,
+            len,
+            None,
+        )
+    }
+
+    pub(crate) fn mike_isogeny_chain_with_prepared_doublings(
+        &self,
+        a_div_three: &Fp2,
+        gluing_kernel: &KernelPoints<Fp2>,
+        chain_kernel: &[[Point<Fp2>; 2]; 2],
+        len: usize,
+        prepared: Option<&PreparedDoublings<Fp2>>,
+    ) -> ThetaStructure<Fp> {
         let n = len - 2;
         let space = (usize::BITS - n.leading_zeros() + 1) as usize;
 
@@ -67,7 +123,8 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>> Curve<Fp2> {
         kernel_points[1] = chain_kernel[1];
         orders[0] = n;
 
-        let mut k = self.advance_strategy(a_div_three, &mut kernel_points, &mut orders, 0);
+        let mut k =
+            self.advance_strategy(a_div_three, &mut kernel_points, &mut orders, 0, prepared);
 
         // Compute the gluing isogeny and push through all the points we doubled for the strategy
         let (mut domain, mut theta_kernel) =
