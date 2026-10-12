@@ -138,6 +138,13 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>> Curve<Fp2> {
         }
         k = k.saturating_sub(1);
 
+        #[cfg(feature = "simd")]
+        if let Some(codomain) =
+            crate::theta::coordinate_simd::try_finish(domain, &theta_kernel, &orders, k, len)
+        {
+            return codomain;
+        }
+
         for step in 0..len {
             // Perform doublings of the kernel elements, decreasing the values of orders
             k = domain.advance_strategy(&mut theta_kernel, &mut orders, k);

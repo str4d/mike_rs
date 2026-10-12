@@ -6,7 +6,10 @@ use fp2::packed::PackedField;
 
 use super::dim_four::{ThetaPoint, ThetaStructure};
 
+mod chain;
 mod codomain;
+#[cfg(feature = "simd")]
+pub(crate) use chain::try_finish;
 
 pub(super) type Point<C> = [<C as PackedField>::Packed; 4];
 

@@ -1,5 +1,4 @@
-// Packed arithmetic is exercised by differential tests until chain integration.
-#[cfg(test)]
+#[cfg(any(feature = "simd", test))]
 pub(crate) mod coordinate_simd;
 
 pub mod dim_four;
