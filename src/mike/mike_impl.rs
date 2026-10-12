@@ -470,20 +470,68 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>, const N: usize> Mike<Fp, Fp2, N
             return Vec::new();
         }
 
-        let trials = peers.len() * receiver_keys.len();
+        let trials = peers
+            .len()
+            .checked_mul(receiver_keys.len())
+            .expect("agreement batch size overflow");
         let mut theta_0_values = Vec::with_capacity(trials);
         let mut theta_n_values = Vec::with_capacity(trials);
         let mut results = vec![Err(MikeError::MismatchedParameters); trials];
 
-        for peer in peers {
-            for key in receiver_keys {
-                if key.constants != peer.constants {
-                    // Keep an inert lane so the batch shape is public and fixed.
-                    theta_0_values.push(Fp::ONE);
-                    theta_n_values.push([Fp::ZERO; 9]);
+        let mut position = 0;
+        while position < trials {
+            #[cfg(feature = "simd")]
+            if trials - position >= 4 {
+                let peer_constants = peers[position / receiver_keys.len()].constants;
+                // Group only by public parameter compatibility. In particular,
+                // do not compact lanes based on secret values or coordinates.
+                if (position..position + 4).all(|index| {
+                    receiver_keys[index % receiver_keys.len()].constants == peer_constants
+                        && peers[index / receiver_keys.len()].constants == peer_constants
+                }) {
+                    let states = core::array::from_fn(|lane| {
+                        let index = position + lane;
+                        let peer = &peers[index / receiver_keys.len()];
+                        let key = &receiver_keys[index % receiver_keys.len()];
+
+                        let (gluing_kernel, chain_kernel) = key.generate_kernels_from_prepared(
+                            &peer.domain,
+                            &peer.P,
+                            Some(&peer.P_x),
+                            &peer.Q,
+                            Some(&peer.Q_x),
+                            &peer.P_32,
+                            &peer.Q_32,
+                            peer.scholten_kernel,
+                            peer.diagonal_kernel,
+                        );
+
+                        peer.domain.start_mike_isogeny_chain(
+                            &peer.a_div_three,
+                            &gluing_kernel,
+                            &chain_kernel,
+                            peer_constants.e,
+                            Some(&peer.chain_doublings),
+                        )
+                    });
+                    for codomain in crate::theta::batch_simd::finish_four(states, peer_constants.e)
+                    {
+                        let (theta_0, theta_n) = codomain.special_modular_invariants_parts();
+                        theta_0_values.push(theta_0);
+                        theta_n_values.push(theta_n);
+                    }
+                    position += 4;
                     continue;
                 }
+            }
 
+            let peer = &peers[position / receiver_keys.len()];
+            let key = &receiver_keys[position % receiver_keys.len()];
+            if key.constants != peer.constants {
+                // Keep an inert lane so the batch shape is public and fixed.
+                theta_0_values.push(Fp::ONE);
+                theta_n_values.push([Fp::ZERO; 9]);
+            } else {
                 let (gluing_kernel, chain_kernel) = key.generate_kernels_from_prepared(
                     &peer.domain,
                     &peer.P,
@@ -508,6 +556,7 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>, const N: usize> Mike<Fp, Fp2, N
                 theta_0_values.push(theta_0);
                 theta_n_values.push(theta_n);
             }
+            position += 1;
         }
 
         Fp::batch_invert(&mut theta_0_values);
@@ -931,6 +980,60 @@ mod batch_test {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(mike.batch_shared_secrets(&keys, &batch_prepared), expected);
+
+        // Exercise complete four-lane groups, short tails, and groups that
+        // cross peer boundaries. The scalar result is the reference ordering.
+        {
+            for key_count in [1usize, 2, 3, 4, 5, 8] {
+                let repeated_keys: Vec<_> = (0..key_count)
+                    .map(|index| {
+                        MikePrivateKey::new(
+                            keys[index % keys.len()].encode(),
+                            mike.params.constants,
+                        )
+                    })
+                    .collect();
+                for peer_count in [1usize, 2, 3] {
+                    let selected_peers = &prepared_peers[..peer_count];
+                    let scalar: Vec<_> = selected_peers
+                        .iter()
+                        .flat_map(|peer| {
+                            repeated_keys
+                                .iter()
+                                .map(|key| key.shared_secret_from_prepared(peer))
+                        })
+                        .collect();
+                    assert_eq!(
+                        mike.batch_shared_secrets(&repeated_keys, selected_peers),
+                        scalar,
+                        "key_count={key_count}, peer_count={peer_count}"
+                    );
+                }
+            }
+        }
+
+        {
+            let mixed_keys = vec![
+                MikePrivateKey::new(keys[0].encode(), mike.params.constants),
+                MikePrivateKey::new(keys[1].encode(), mismatched),
+                MikePrivateKey::new(keys[2].encode(), mike.params.constants),
+                MikePrivateKey::new(keys[0].encode(), mike.params.constants),
+                MikePrivateKey::new(keys[1].encode(), mike.params.constants),
+            ];
+            let mixed_scalar: Vec<_> = prepared_peers
+                .iter()
+                .flat_map(|peer| {
+                    mixed_keys
+                        .iter()
+                        .map(|key| key.shared_secret_from_prepared(peer))
+                })
+                .collect();
+            assert_eq!(
+                mike.batch_shared_secrets(&mixed_keys, &prepared_peers),
+                mixed_scalar
+            );
+        }
+
         for (scalar, batched) in prepared_peers.iter().zip(&batch_prepared) {
             for key in &keys {
                 assert_eq!(
