@@ -114,6 +114,22 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>> Curve<Fp2> {
         len: usize,
         prepared: Option<&PreparedDoublings<Fp2>>,
     ) -> ThetaStructure<Fp> {
+        self.start_mike_isogeny_chain(a_div_three, gluing_kernel, chain_kernel, len, prepared)
+            .finish(len)
+    }
+
+    /// Builds the public gluing portion of a MIKE chain.
+    ///
+    /// The returned state can be finished independently or together with three compatible
+    /// states.
+    pub(crate) fn start_mike_isogeny_chain(
+        &self,
+        a_div_three: &Fp2,
+        gluing_kernel: &KernelPoints<Fp2>,
+        chain_kernel: &[[Point<Fp2>; 2]; 2],
+        len: usize,
+        prepared: Option<&PreparedDoublings<Fp2>>,
+    ) -> MikeChainState<Fp> {
         let n = len - 2;
         let space = (usize::BITS - n.leading_zeros() + 1) as usize;
 
@@ -127,7 +143,7 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>> Curve<Fp2> {
             self.advance_strategy(a_div_three, &mut kernel_points, &mut orders, 0, prepared);
 
         // Compute the gluing isogeny and push through all the points we doubled for the strategy
-        let (mut domain, mut theta_kernel) =
+        let (domain, mut theta_kernel) =
             gluing_isogeny(self, gluing_kernel, &kernel_points[..(2 * k)]);
         // Gluing isogeny creates theta_kernel of length 2*k but we need it to have a minimum size
         theta_kernel.resize(2 * space, ThetaPoint::default());
@@ -137,6 +153,36 @@ impl<Fp: FqTrait, Fp2: Fp2Trait<BaseField = Fp>> Curve<Fp2> {
             *ord -= 1;
         }
         k = k.saturating_sub(1);
+
+        MikeChainState {
+            domain,
+            theta_kernel,
+            orders,
+            k,
+        }
+    }
+}
+
+/// A chain after gluing, ready for scalar or packed theta evaluation.
+#[derive(Clone)]
+pub(crate) struct MikeChainState<Fp: FqTrait> {
+    pub(crate) domain: ThetaStructure<Fp>,
+    pub(crate) theta_kernel: Vec<ThetaPoint<Fp>>,
+    pub(crate) orders: Vec<usize>,
+    pub(crate) k: usize,
+}
+
+impl<Fp: FqTrait> MikeChainState<Fp> {
+    /// Finishes the chain.
+    ///
+    /// This uses the coordinate SIMD path when available.
+    pub(crate) fn finish(self, len: usize) -> ThetaStructure<Fp> {
+        let Self {
+            mut domain,
+            mut theta_kernel,
+            mut orders,
+            mut k,
+        } = self;
 
         #[cfg(feature = "simd")]
         if let Some(codomain) =
