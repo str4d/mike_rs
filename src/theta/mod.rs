@@ -1,3 +1,7 @@
+// Packed arithmetic is exercised by differential tests until chain integration.
+#[cfg(test)]
+pub(crate) mod coordinate_simd;
+
 pub mod dim_four;
 pub mod dim_two;
 pub(crate) mod isogeny;
